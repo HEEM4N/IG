@@ -1,0 +1,10 @@
+# Environment variables — NEVER commit this
+.env
+
+# Node modules
+node_modules/
+
+# Runtime data files (Railway uses ephemeral storage — see note in README)
+monitoring_base.json
+old_clients.json
+permissions.json
