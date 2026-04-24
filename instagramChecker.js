@@ -1,38 +1,29 @@
 /**
  * instagramChecker.js
- * Checks if an Instagram account is accessible (unbanned).
- * When accessible, also scrapes public profile stats:
- *   followers, following, post count, display name, profile picture URL.
- * No login required — public profile page only.
+ * Checks if an Instagram account is accessible (unbanned) via HikerAPI.
+ * Also returns public profile stats: followers, following, post count,
+ * display name, and profile picture URL.
+ *
+ * API: https://hikerapi.com
+ * Endpoint: GET https://api.hikerapi.com/v1/user/by/username?username=<username>
+ * Auth: x-access-key header (set HIKER_API_KEY in your .env)
  */
 
 const axios = require("axios");
 
-const USER_AGENTS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
-  "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-];
-
-let uaIndex = 0;
-function getNextUserAgent() {
-  const ua = USER_AGENTS[uaIndex % USER_AGENTS.length];
-  uaIndex++;
-  return ua;
-}
+const HIKER_API_BASE = "https://api.hikerapi.com";
+const HIKER_API_KEY  = process.env.HIKER_API_KEY;
 
 function jitter(baseMs) {
-  const variance = 3000;
+  const variance = 5000;
   return baseMs + Math.floor(Math.random() * variance * 2) - variance;
 }
 
 const STATUS = {
-  BANNED: "BANNED",
-  ACCESSIBLE: "ACCESSIBLE",
+  BANNED:       "BANNED",
+  ACCESSIBLE:   "ACCESSIBLE",
   RATE_LIMITED: "RATE_LIMITED",
-  ERROR: "ERROR",
+  ERROR:        "ERROR",
 };
 
 /**
@@ -47,121 +38,7 @@ function formatCount(n) {
 }
 
 /**
- * Try to extract profile stats from the raw HTML of an Instagram profile page.
- * Instagram embeds a JSON blob in a <script> tag — we parse that.
- *
- * Returns:
- * {
- *   followers:    number | null,
- *   following:    number | null,
- *   posts:        number | null,
- *   displayName:  string | null,
- *   profilePicUrl: string | null,   ← full-size HD picture URL from the page
- *   isPrivate:    boolean,
- * }
- */
-function extractProfileStats(html, username) {
-  const stats = {
-    followers: null,
-    following: null,
-    posts: null,
-    displayName: null,
-    profilePicUrl: null,
-    isPrivate: false,
-  };
-
-  try {
-    // ── Method 1: shared_data JSON blob (older Instagram pages) ─────────────
-    const sharedDataMatch = html.match(/window\._sharedData\s*=\s*(\{.+?\});<\/script>/s);
-    if (sharedDataMatch) {
-      const json = JSON.parse(sharedDataMatch[1]);
-      const user = json?.entry_data?.ProfilePage?.[0]?.graphql?.user;
-      if (user) {
-        stats.followers    = user.edge_followed_by?.count ?? null;
-        stats.following    = user.edge_follow?.count       ?? null;
-        stats.posts        = user.edge_owner_to_timeline_media?.count ?? null;
-        stats.displayName  = user.full_name  || null;
-        stats.profilePicUrl = user.profile_pic_url_hd || user.profile_pic_url || null;
-        stats.isPrivate    = user.is_private ?? false;
-        return stats;
-      }
-    }
-
-    // ── Method 2: __additionalDataLoaded / push JSON (newer pages) ──────────
-    const additionalMatch = html.match(/{"require":\[\["ScheduledServerJS".*?"user":\{(.+?)"id":"\d+"/s);
-    if (additionalMatch) {
-      // Try to grab individual fields from the raw JSON fragment
-      const frag = additionalMatch[0];
-
-      const followersM = frag.match(/"edge_followed_by":\{"count":(\d+)/);
-      const followingM = frag.match(/"edge_follow":\{"count":(\d+)/);
-      const postsM     = frag.match(/"edge_owner_to_timeline_media":\{"count":(\d+)/);
-      const nameM      = frag.match(/"full_name":"([^"]+)"/);
-      const picM       = frag.match(/"profile_pic_url_hd":"([^"]+)"/);
-      const picFallM   = frag.match(/"profile_pic_url":"([^"]+)"/);
-      const privateM   = frag.match(/"is_private":(true|false)/);
-
-      if (followersM) stats.followers   = parseInt(followersM[1], 10);
-      if (followingM) stats.following   = parseInt(followingM[1], 10);
-      if (postsM)     stats.posts       = parseInt(postsM[1], 10);
-      if (nameM)      stats.displayName = nameM[1].replace(/\\u([\dA-Fa-f]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
-      if (picM || picFallM) {
-        // Instagram escapes forward slashes in JSON: \/  → /
-        stats.profilePicUrl = (picM?.[1] || picFallM?.[1]).replace(/\\\//g, "/");
-      }
-      if (privateM)   stats.isPrivate   = privateM[1] === "true";
-
-      if (stats.followers !== null) return stats; // got at least followers, good enough
-    }
-
-    // ── Method 3: meta tags as last resort (less data but reliable) ─────────
-    const descM = html.match(/<meta\s+name="description"\s+content="([^"]+)"/i)
-               || html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i);
-    if (descM) {
-      // Format: "123K Followers, 456 Following, 789 Posts - See Instagram..."
-      const desc = descM[1];
-      const fM = desc.match(/([\d,.]+[KMB]?)\s+Followers?/i);
-      const gM = desc.match(/([\d,.]+[KMB]?)\s+Following/i);
-      const pM = desc.match(/([\d,.]+[KMB]?)\s+Posts?/i);
-      if (fM) stats.followers = parseAbbreviated(fM[1]);
-      if (gM) stats.following = parseAbbreviated(gM[1]);
-      if (pM) stats.posts     = parseAbbreviated(pM[1]);
-    }
-
-    // Profile pic from og:image meta tag
-    const picMetaM = html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i);
-    if (picMetaM) stats.profilePicUrl = picMetaM[1];
-
-    // Display name from og:title
-    const titleM = html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i);
-    if (titleM) {
-      // Format: "Display Name (@username) • Instagram..."
-      const nameMatch = titleM[1].match(/^(.+?)\s*\(@/);
-      if (nameMatch) stats.displayName = nameMatch[1].trim();
-    }
-
-  } catch (e) {
-    // Parsing failed silently — stats remain null
-  }
-
-  return stats;
-}
-
-/**
- * Parse abbreviated numbers like "1.2M", "45.3K", "1,234" → raw number
- */
-function parseAbbreviated(str) {
-  if (!str) return null;
-  const clean = str.replace(/,/g, "");
-  if (/B$/i.test(clean)) return Math.round(parseFloat(clean) * 1_000_000_000);
-  if (/M$/i.test(clean)) return Math.round(parseFloat(clean) * 1_000_000);
-  if (/K$/i.test(clean)) return Math.round(parseFloat(clean) * 1_000);
-  return parseInt(clean, 10) || null;
-}
-
-/**
- * Check if an Instagram username is currently accessible.
- * When accessible, also returns profile stats.
+ * Check if an Instagram username is currently accessible via HikerAPI.
  *
  * @param {string} username
  * @returns {{
@@ -179,68 +56,97 @@ function parseAbbreviated(str) {
  * }}
  */
 async function checkAccount(username) {
-  const url       = `https://www.instagram.com/${username}/`;
   const checkedAt = new Date();
 
+  if (!HIKER_API_KEY) {
+    return {
+      status: STATUS.ERROR,
+      checkedAt,
+      detail: "HIKER_API_KEY is not set in environment variables.",
+      profile: null,
+    };
+  }
+
   try {
-    const response = await axios.get(url, {
-      timeout: 10000,
-      maxRedirects: 3,
-      headers: {
-        "User-Agent": getNextUserAgent(),
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
-        Connection: "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Cache-Control": "max-age=0",
-      },
+    const response = await axios.get(`${HIKER_API_BASE}/v1/user/by/username`, {
+      params:  { username },
+      headers: { "x-access-key": HIKER_API_KEY },
+      timeout: 15000,
       validateStatus: () => true,
     });
 
     const { status: httpStatus, data } = response;
 
+    // ── Rate limited ──────────────────────────────────────────────────────
     if (httpStatus === 429) {
-      return { status: STATUS.RATE_LIMITED, checkedAt, detail: "Rate limited by Instagram. Backing off.", profile: null };
+      return {
+        status: STATUS.RATE_LIMITED,
+        checkedAt,
+        detail: "Rate limited by HikerAPI. Backing off.",
+        profile: null,
+      };
     }
 
+    // ── Unauthorized ──────────────────────────────────────────────────────
+    if (httpStatus === 401 || httpStatus === 403) {
+      return {
+        status: STATUS.ERROR,
+        checkedAt,
+        detail: `HikerAPI auth error (HTTP ${httpStatus}). Check your HIKER_API_KEY.`,
+        profile: null,
+      };
+    }
+
+    // ── Account not found / banned ─────────────────────────────────────────
     if (httpStatus === 404) {
-      return { status: STATUS.BANNED, checkedAt, detail: "Profile not found (404).", profile: null };
+      return {
+        status: STATUS.BANNED,
+        checkedAt,
+        detail: "Account not found via HikerAPI (404) — likely banned or deleted.",
+        profile: null,
+      };
     }
 
-    if (httpStatus === 200) {
-      const isSorryPage =
-        data.includes("Sorry, this page isn") ||
-        data.includes("isn't available") ||
-        data.includes("page not available");
+    // ── Successful response ────────────────────────────────────────────────
+    if (httpStatus === 200 && data && data.username) {
+      const profile = {
+        followers:    data.follower_count    ?? null,
+        following:    data.following_count   ?? null,
+        posts:        data.media_count       ?? null,
+        displayName:  data.full_name         || null,
+        profilePicUrl: data.profile_pic_url  || null,
+        isPrivate:    data.is_private        ?? false,
+      };
 
-      if (isSorryPage) {
-        return { status: STATUS.BANNED, checkedAt, detail: "Page shows 'not available' message.", profile: null };
-      }
-
-      const hasProfile =
-        data.includes(`"username":"${username}"`) ||
-        data.includes(`/@${username}`) ||
-        data.includes(`"ProfilePage"`) ||
-        data.includes(`instagram.com/${username}`);
-
-      if (hasProfile) {
-        // ✅ Profile is live — extract stats from the page
-        const profile = extractProfileStats(data, username);
-        return { status: STATUS.ACCESSIBLE, checkedAt, detail: "Profile is publicly accessible.", profile };
-      }
-
-      return { status: STATUS.BANNED, checkedAt, detail: "Ambiguous response — treating as unavailable.", profile: null };
+      return {
+        status: STATUS.ACCESSIBLE,
+        checkedAt,
+        detail: "Profile is publicly accessible.",
+        profile,
+      };
     }
 
-    return { status: STATUS.BANNED, checkedAt, detail: `HTTP ${httpStatus}`, profile: null };
+    // ── API returned 200 but empty/null user ───────────────────────────────
+    if (httpStatus === 200 && (!data || !data.username)) {
+      return {
+        status: STATUS.BANNED,
+        checkedAt,
+        detail: "HikerAPI returned empty user — account likely banned or deleted.",
+        profile: null,
+      };
+    }
+
+    // ── Unexpected response ────────────────────────────────────────────────
+    return {
+      status: STATUS.ERROR,
+      checkedAt,
+      detail: `Unexpected HTTP ${httpStatus} from HikerAPI.`,
+      profile: null,
+    };
 
   } catch (err) {
     if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
-      return { status: STATUS.ERROR, checkedAt, detail: "Request timed out.", profile: null };
+      return { status: STATUS.ERROR, checkedAt, detail: "Request to HikerAPI timed out.", profile: null };
     }
     return { status: STATUS.ERROR, checkedAt, detail: err.message, profile: null };
   }
